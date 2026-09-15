@@ -1,0 +1,27 @@
+# Keep the backend build context lean — none of this belongs in the image.
+# (The image installs deps from requirements.txt and COPYs the source; runtime
+#  data lives in the db_data volume, and .env is provided by docker-compose.)
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime data + SQLite DB (created at runtime, never baked in)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets / local env (compose supplies these)
+.env
+.env.*
+
+# Virtualenvs, logs, OS cruft
+.venv/
+venv/
+*.log
+.DS_Store

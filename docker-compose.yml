@@ -1,0 +1,59 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    # The API is reachable by the frontend over Docker's private network.
+    # Do not publish it on the host: the VPN-capable backend is not a public
+    # service and should only be reached through nginx.
+    expose:
+      - "8000"
+    # OpenVPN client runs INSIDE this container so outbound calls (downloads,
+    # scrapers) transit the tunnel when enabled. NET_ADMIN + /dev/net/tun let
+    # it create the tunnel and manage routes/iptables. These are inert until
+    # an OpenVPN profile is configured.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    volumes:
+      - ${MEDIA_DIR:-./media/library}:/media/library
+      - ./backend:/app
+      - ./vpn_profiles:/opt/vpn_profiles:ro
+      - ./.env:/app/.env
+      - db_data:/app/data
+    environment:
+      - ENV_FILE=/app/.env
+      - MEDIA_DIR=/media/library
+      - DATABASE_URL=sqlite:////app/data/riprate.db
+      - SECRET_KEY=${SECRET_KEY:-}
+      - SESSION_SECURE=${SESSION_SECURE:-false}
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
+      - SEGMENT_CONNECTIONS=${SEGMENT_CONNECTIONS:-3}
+      - PREFERRED_QUALITY=${PREFERRED_QUALITY:-1080}
+      - MAX_FILE_SIZE_GB=${MAX_FILE_SIZE_GB:-10.0}
+      - VIDEO_CRF=${VIDEO_CRF:-20}
+      - VIDEO_PRESET=${VIDEO_PRESET:-medium}
+      - HISTORY_RETENTION_DAYS=${HISTORY_RETENTION_DAYS:-30}
+      - SEARCH_SOURCE=${SEARCH_SOURCE:-tmdb}
+      - VPN_PROFILE_DIR=/app/data/vpn-profiles
+      - IMDB_COOKIE=${IMDB_COOKIE:-}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - WYZIE_API_KEY=${WYZIE_API_KEY:-}
+      #- MAX_STREAM_KBPS=${MAX_STREAM_KBPS:-5000}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      # Local-only by default. Use an explicitly configured reverse proxy if
+      # remote access is needed; do not bind the app directly to 0.0.0.0.
+      - "127.0.0.1:5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  db_data:

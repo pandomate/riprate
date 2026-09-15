@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    /* Tell the browser to render form controls & scrollbars in dark mode
+       (kills the bright white scrollbar track that clashed with the theme). */
+    color-scheme: dark;
+    background-color: theme(colors.gray.950);
+  }
+  body {
+    @apply bg-gray-950 text-gray-100 min-h-screen antialiased;
+  }
+
+  /* Themed scrollbars (WebKit/Blink) */
+  ::-webkit-scrollbar { width: 12px; height: 12px; }
+  ::-webkit-scrollbar-track { background: theme(colors.gray.950); }
+  ::-webkit-scrollbar-thumb {
+    background: theme(colors.gray.700);
+    border-radius: 9999px;
+    border: 3px solid theme(colors.gray.950);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: theme(colors.gray.600); }
+  ::-webkit-scrollbar-corner { background: theme(colors.gray.950); }
+
+  /* Firefox */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: theme(colors.gray.700) theme(colors.gray.950);
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg font-medium transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-sky-600 hover:bg-sky-500 text-white;
+  }
+  .btn-secondary {
+    @apply btn bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700;
+  }
+  .btn-danger {
+    @apply btn bg-red-700 hover:bg-red-600 text-white;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent hover:bg-gray-800 text-gray-300;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1 text-sm rounded-md;
+  }
+  .btn-xs {
+    @apply px-2 py-0.5 text-xs rounded-md gap-1;
+  }
+  .card {
+    @apply bg-gray-900 rounded-xl border border-gray-800 p-4;
+  }
+  .input {
+    @apply bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent w-full;
+  }
+  .label {
+    @apply block text-sm font-medium text-gray-400 mb-1;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium border;
+  }
+  .badge-queued      { @apply badge bg-yellow-900/40 text-yellow-300 border-yellow-700/60; }
+  .badge-downloading { @apply badge bg-sky-900/40 text-sky-300 border-sky-700/60; }
+  .badge-processing  { @apply badge bg-purple-900/40 text-purple-300 border-purple-700/60; }
+  .badge-paused      { @apply badge bg-orange-900/40 text-orange-300 border-orange-700/60; }
+  .badge-completed   { @apply badge bg-green-900/40 text-green-300 border-green-700/60; }
+  .badge-failed      { @apply badge bg-red-900/40 text-red-300 border-red-700/60; }
+  .badge-pending     { @apply badge bg-yellow-900/40 text-yellow-300 border-yellow-700/60; }
+  .badge-approved    { @apply badge bg-green-900/40 text-green-300 border-green-700/60; }
+  .badge-denied      { @apply badge bg-red-900/40 text-red-300 border-red-700/60; }
+  .badge-neutral     { @apply badge bg-gray-800 text-gray-300 border-gray-700; }
+
+  .th {
+    @apply text-left text-xs font-semibold uppercase tracking-wide text-gray-500 px-3 py-2;
+  }
+  .td {
+    @apply px-3 py-2 text-sm text-gray-200 align-middle;
+  }
+}

@@ -1,0 +1,14 @@
+# Keep the frontend build context lean. The image runs `npm install` and
+# `npm run build` itself, so the host's installed deps and prior build output
+# must NOT be copied in (they'd shadow a clean build and bloat the context).
+
+node_modules/
+dist/
+.vite/
+
+# npm / yarn logs, secrets, OS cruft
+npm-debug.log*
+yarn-error.log*
+.env
+.env.*
+.DS_Store
