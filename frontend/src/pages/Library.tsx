@@ -64,6 +64,8 @@ export default function Library() {
   };
   useEffect(() => {
     load().catch(() => {}).finally(() => setLoading(false));
+    const timer = window.setInterval(() => { load().catch(() => {}); }, 15000);
+    return () => window.clearInterval(timer);
   }, []);
   useEffect(() => { setMoviePage(0); }, [movieQuery]);
   useEffect(() => { setShowPage(0); }, [showQuery]);

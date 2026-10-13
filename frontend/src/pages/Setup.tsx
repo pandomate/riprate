@@ -83,7 +83,7 @@ export default function Setup({ onComplete }: { onComplete: () => void }) {
           tmdb_api_key: "",
           imdb_cookie: "",
           wyzie_api_key: "",
-          wyzie_enabled: c.wyzie_enabled ?? true,
+          wyzie_enabled: c.wyzie_enabled ?? false,
           subtitle_language: c.subtitle_language || "en",
           max_concurrent_downloads: c.max_concurrent_downloads || 3,
           segment_connections: c.segment_connections || 6,
@@ -407,11 +407,13 @@ export default function Setup({ onComplete }: { onComplete: () => void }) {
           {step === 5 && (
             <div className="space-y-3">
               <p className="text-sm text-gray-500">
-                Wyzie Subs fetches subtitles when a stream has none. A free key comes from{" "}
+                When enabled with an API key, Wyzie Subs is the preferred subtitle source.
+                Stream provider subtitles are used if Wyzie is disabled, has no key, or cannot find subtitles.
+                A free key comes from{" "}
                 <span className="font-mono text-gray-400">store.wyzie.io/redeem</span>.
               </p>
               <div>
-                <label className="label">Wyzie API key <span className="text-gray-600">(leave blank to keep subtitles off)</span></label>
+                <label className="label">Wyzie API key <span className="text-gray-600">(leave blank to keep the current key)</span></label>
                 <input className="input font-mono text-sm" value={form.wyzie_api_key}
                   placeholder={cfg.wyzie_api_key_set ? "(already set — leave blank to keep)" : "wyzie key…"}
                   onChange={(e) => up({ wyzie_api_key: e.target.value })} />
@@ -468,7 +470,7 @@ export default function Setup({ onComplete }: { onComplete: () => void }) {
               <Row k="Search source" v={form.search_source} />
               <Row k="Downloads" v={`${form.max_concurrent_downloads} concurrent · ${form.segment_connections} connections · ${form.subtitle_language} subtitles`} />
               <Row k="History retention" v={form.history_retention_days === 0 ? "keep forever" : `${form.history_retention_days} days`} />
-              <Row k="Subtitles" v={form.wyzie_enabled && (form.wyzie_api_key.trim() || cfg.wyzie_api_key_set) ? "Wyzie on" : "off"} />
+              <Row k="Subtitles" v={form.wyzie_enabled && (form.wyzie_api_key.trim() || cfg.wyzie_api_key_set) ? "Wyzie first · stream fallback" : "Stream provider"} />
               <Row k="Providers" v={form.providers.filter((p) => p.enabled).map((p) => p.label).join(", ") || "none"} />
               <Row k="VPN" v="OpenVPN profile pool — optional" />
             </div>

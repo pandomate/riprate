@@ -1,6 +1,6 @@
 import { RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../App";
-import { EpisodeMeta, search, watch, TitleMeta, WatchItem } from "../api/client";
+import { EpisodeMeta, search, subtitleTiming, watch, TitleMeta, WatchItem } from "../api/client";
 import { fmtBytes, useToast } from "../components/ui";
 import { ICalendar, IHeart, IRestart } from "../components/icons";
 import { useNavCounts } from "../components/Layout";
@@ -66,7 +66,11 @@ export default function Watch() {
       .then((l) => { setItems(l.items); setTitles(l.titles); setLoading(false); })
       .catch(() => setLoading(false));
 
-  useEffect(() => { reload(); }, []);
+  useEffect(() => {
+    reload();
+    const timer = window.setInterval(reload, 15000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // While something is downloading, refresh the library so finished files show
   // up live; also refresh once when the last download completes.
@@ -905,6 +909,7 @@ function Player({ item, next, onClose, onPlayNext, onProgressSaved, fsRef }: {
   const posRef = useRef({ position: item.position, duration: item.duration });
   const hideTimer = useRef<number | null>(null);
   const menuOpenRef = useRef(false);
+  const originalCueTimes = useRef(new WeakMap<TextTrackCue, [number, number]>());
 
   const [paused, setPaused] = useState(true);
   const [cur, setCur] = useState(0);
@@ -927,8 +932,81 @@ function Player({ item, next, onClose, onPlayNext, onProgressSaved, fsRef }: {
   const [cancelled, setCancelled] = useState(false);   // per-playback autonext cancel
   const [countdown, setCountdown] = useState<number | null>(null);
   const [resumedFrom, setResumedFrom] = useState<number | null>(null);
+  const [subtitleOffset, setSubtitleOffset] = useState(0);
+  const [subtitleVersion, setSubtitleVersion] = useState(0);
+  const [subtitleSyncing, setSubtitleSyncing] = useState(false);
+  const [subtitleMessage, setSubtitleMessage] = useState("");
+  const isAdmin = useAuth()?.role === "admin";
 
   useEffect(() => { menuOpenRef.current = menuOpen; }, [menuOpen]);
+
+  const applySubtitleOffset = (offset: number) => {
+    const track = videoRef.current?.textTracks[0];
+    if (!track?.cues) return;
+    for (let index = 0; index < track.cues.length; index += 1) {
+      const cue = track.cues[index];
+      let original = originalCueTimes.current.get(cue);
+      if (!original) {
+        original = [cue.startTime, cue.endTime];
+        originalCueTimes.current.set(cue, original);
+      }
+      cue.startTime = Math.max(0, original[0] + offset);
+      cue.endTime = Math.max(cue.startTime + 0.001, original[1] + offset);
+    }
+  };
+
+  const changeSubtitleOffset = (offset: number) => {
+    const rounded = Math.round(Math.max(-600, Math.min(600, offset)) * 10) / 10;
+    setSubtitleOffset(rounded);
+    applySubtitleOffset(rounded);
+  };
+
+  const reloadSubtitles = () => {
+    originalCueTimes.current = new WeakMap();
+    setSubtitleOffset(0);
+    setSubtitleVersion((value) => value + 1);
+  };
+
+  const runSubtitleSync = async () => {
+    setSubtitleSyncing(true);
+    setSubtitleMessage("Starting audio alignment…");
+    try {
+      let state = await subtitleTiming.startAutoSync(item.id);
+      setSubtitleMessage(state.message);
+      while (state.status === "running") {
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        state = await subtitleTiming.syncStatus(item.id);
+        setSubtitleMessage(state.message);
+      }
+      if (state.status === "completed") reloadSubtitles();
+    } catch (err: unknown) {
+      setSubtitleMessage(err instanceof Error ? err.message : "Subtitle alignment failed");
+    } finally {
+      setSubtitleSyncing(false);
+    }
+  };
+
+  const saveSubtitleOffset = async () => {
+    if (!subtitleOffset) return;
+    setSubtitleMessage("Saving subtitle timing…");
+    try {
+      await subtitleTiming.saveOffset(item.id, subtitleOffset);
+      setSubtitleMessage("Timing saved for RipRate and external-subtitle players.");
+      reloadSubtitles();
+    } catch (err: unknown) {
+      setSubtitleMessage(err instanceof Error ? err.message : "Could not save subtitle timing");
+    }
+  };
+
+  const restoreSubtitles = async () => {
+    try {
+      await subtitleTiming.restore(item.id);
+      setSubtitleMessage("Original subtitle timing restored.");
+      reloadSubtitles();
+    } catch (err: unknown) {
+      setSubtitleMessage(err instanceof Error ? err.message : "No original backup is available");
+    }
+  };
 
   const label = item.media_type === "tvSeries"
     ? `${item.title} · ${epLabel(item)}${item.episode_title ? ` · ${item.episode_title}` : ""}`
@@ -1112,7 +1190,10 @@ function Player({ item, next, onClose, onPlayNext, onProgressSaved, fsRef }: {
         onPause={onPauseEvt}
       >
         {item.has_subtitle && (
-          <track src={watch.subtitleUrl(item.id)} kind="subtitles" srcLang="en" label="English" default />
+          <track key={subtitleVersion}
+            src={`${watch.subtitleUrl(item.id)}?v=${subtitleVersion}`}
+            kind="subtitles" srcLang="en" label="English" default
+            onLoad={() => applySubtitleOffset(subtitleOffset)} />
         )}
       </video>
 
@@ -1189,13 +1270,37 @@ function Player({ item, next, onClose, onPlayNext, onProgressSaved, fsRef }: {
 
       {/* settings menu */}
       {menuOpen && (
-        <div className="absolute bottom-20 right-4 w-60 bg-gray-900/95 border border-gray-700 rounded-xl p-3 text-sm text-gray-200 shadow-xl space-y-3">
+        <div className="absolute bottom-20 right-4 w-72 bg-gray-900/95 border border-gray-700 rounded-xl p-3 text-sm text-gray-200 shadow-xl space-y-3 max-h-[70vh] overflow-y-auto">
           <div>
             <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Subtitles</div>
             {item.has_subtitle ? (
               <div className="space-y-0.5">
                 <MenuOpt label="Off" active={!ccOn} onClick={() => setCcOn(false)} />
                 <MenuOpt label="English" active={ccOn} onClick={() => setCcOn(true)} />
+                <div className="pt-2 mt-2 border-t border-gray-700 space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-gray-400">Timing offset</span>
+                    <span className="font-mono text-gray-200">{subtitleOffset > 0 ? "+" : ""}{subtitleOffset.toFixed(1)}s</span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1">
+                    <button className="btn-secondary btn-sm" onClick={() => changeSubtitleOffset(subtitleOffset - 1)}>−1s</button>
+                    <button className="btn-secondary btn-sm" onClick={() => changeSubtitleOffset(subtitleOffset - .1)}>−.1s</button>
+                    <button className="btn-secondary btn-sm" onClick={() => changeSubtitleOffset(subtitleOffset + .1)}>+.1s</button>
+                    <button className="btn-secondary btn-sm" onClick={() => changeSubtitleOffset(subtitleOffset + 1)}>+1s</button>
+                  </div>
+                  <p className="text-[11px] text-gray-500">Use − if subtitles appear late; use + if they appear early.</p>
+                  {isAdmin && (
+                    <div className="grid grid-cols-2 gap-1">
+                      <button className="btn-primary btn-sm" disabled={!subtitleOffset || subtitleSyncing}
+                        onClick={saveSubtitleOffset}>Save offset</button>
+                      <button className="btn-secondary btn-sm" disabled={subtitleSyncing}
+                        onClick={runSubtitleSync}>{subtitleSyncing ? "Aligning…" : "Auto align"}</button>
+                      <button className="btn-secondary btn-sm col-span-2" disabled={subtitleSyncing}
+                        onClick={restoreSubtitles}>Restore original</button>
+                    </div>
+                  )}
+                  {subtitleMessage && <p className="text-[11px] text-gray-300" role="status">{subtitleMessage}</p>}
+                </div>
               </div>
             ) : (
               <div className="text-gray-500 px-2 py-1">No subtitles available</div>

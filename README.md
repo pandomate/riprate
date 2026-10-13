@@ -28,9 +28,9 @@ cd riprate
 
 start.sh creates .env from .env.example when necessary, generates a strong
 SECRET_KEY, creates the host media directory, builds both images, and starts
-the stack. Open http://localhost:5173. The frontend is bound to localhost only
-and the backend API is kept on Docker's private network; neither service is
-published to public host interfaces by the default compose file.
+the stack. Open http://127.0.0.1:5173. The frontend is bound to loopback only,
+and the backend API remains on Docker's private network behind the frontend
+proxy.
 
 The first visit opens the setup wizard. It configures:
 
@@ -154,6 +154,24 @@ stay where they are when a category folder is changed; new downloads use the
 updated folder. Settings includes a tool for moving an existing folder into
 another category.
 
+The library automatically scans the mounted media folder every 15 seconds.
+MP4, M4V, MKV, and WebM files are indexed after two unchanged scans; local NFO
+metadata and standard movie/episode filenames identify imported media. Moved
+files are matched using metadata or an unambiguous filename and size. Missing
+files disappear from the available library after two scans, while their database
+records and watch history are retained. Restoring a file restores its availability.
+Deleting a file outside RipRate does not automatically download it again. Library
+and Watch pages refresh automatically; changes normally appear within 45 seconds.
+
+For network storage, set `MEDIA_MOUNT` to the host mountpoint (for example
+`/mnt/smb`) and `MEDIA_EXPECTED_FSTYPE` to `9p` for a WSL network drive or `cifs`
+for native Linux SMB. Mount the share before running `./start.sh`. The launcher
+checks that the host and container see the same directory, and the backend refuses
+to start on the wrong filesystem. Docker uses a bind mount, so files are shared
+directly rather than copied into a separate Docker volume. After changing or
+remounting the host drive, recreate the containers with `./start.sh` (without
+`--fresh`). Mount failures skip database reconciliation and block new downloads.
+
 ## Downloads, providers, and subtitles
 
 Nova is the current stream provider. Its resolver may return a variable number
@@ -176,9 +194,16 @@ Subtitle behavior is independent from original audio:
 
 - the subtitle language defaults to English (en);
 - the language can be changed in Setup or Settings → Downloads;
-- RipRate searches matching Nova/HLS subtitle tracks and Wyzie results;
+- enable or disable Wyzie in Setup or Settings → Wyzie Subs (disabled by default);
+- when enabled with a key, Wyzie is tried first for downloads and subtitle retries;
+- stream provider subtitles (including HLS tracks during downloads) are used when
+  Wyzie is disabled, has no key, finds no match, or fails;
 - selected subtitles are cleaned and saved as Jellyfin-friendly .vtt sidecars;
-- Wyzie is optional and requires an API key from store.wyzie.io/redeem.
+- subtitle timing is aligned locally against the downloaded audio by default;
+- the RipRate player provides ±0.1s/±1s preview controls, a saved fixed offset,
+  audio-based auto alignment, and restoration of the original timing;
+- Wyzie is optional and requires an API key from store.wyzie.io/redeem;
+- changes to the Wyzie switch apply to subsequent subtitle requests without a restart.
 
 ## Scheduling and requests
 
@@ -237,11 +262,12 @@ deployment-specific paths.
 | VIDEO_CRF | 20 | x264 quality setting used only when re-encoding. |
 | VIDEO_PRESET | medium | x264 encoding preset used only when re-encoding. |
 | HISTORY_RETENTION_DAYS | 30 | Automatic history cleanup; 0 keeps history indefinitely. |
+| FAILED_TEMP_RETENTION_HOURS | 0 | Failed download temp cleanup; 0 deletes immediately, or set hours to retain until cleanup/restart. |
 | SEARCH_SOURCE | tmdb | tmdb or imdb for title/season/episode searches. |
 | TMDB_API_KEY | empty | TMDB v4 token; required for TMDB search and Nova. |
 | IMDB_COOKIE | empty | Optional browser Cookie header for IMDB access. |
 | WYZIE_API_KEY | empty | Optional subtitle API key. |
-| WYZIE_ENABLED | false | Enables Wyzie fallback when a key is configured. |
+| WYZIE_ENABLED | false | Prefers Wyzie subtitles when a key is configured; otherwise uses stream subtitles. |
 | VPN_OPENVPN_HEALTH_INTERVAL | 30 | Seconds between direct OpenVPN egress checks. |
 | VPN_OPENVPN_HEALTH_FAILURES | 2 | Consecutive failed checks before rotation. |
 

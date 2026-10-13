@@ -65,6 +65,7 @@ class Settings:
         self.secret_key = os.environ.get("SECRET_KEY", "")
         self.database_url = os.environ.get("DATABASE_URL", "sqlite:///./riprate.db")
         self.media_dir = os.environ.get("MEDIA_DIR", "/root/media")
+        self.media_expected_fstype = os.environ.get("MEDIA_EXPECTED_FSTYPE", "").strip()
         self.admin_username = os.environ.get("ADMIN_USERNAME", "admin")
         self.admin_password = os.environ.get("ADMIN_PASSWORD", "")
         self.max_concurrent_downloads = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
@@ -74,7 +75,7 @@ class Settings:
         # and to fetch title metadata (posters, plots) for Watch/Jellyfin.
         self.tmdb_api_key = os.environ.get("TMDB_API_KEY", "")
         # Wyzie Subs API key (free — store.wyzie.io/redeem); enables subtitle
-        # downloads from sub.wyzie.io when the stream itself has none.
+        # priority downloads from sub.wyzie.io when enabled.
         self.wyzie_api_key = os.environ.get("WYZIE_API_KEY", "")
         # Cached TMDB metadata images (posters/backdrops) live here.
         self.meta_dir = os.environ.get("META_DIR", "./data/metadata")

@@ -535,6 +535,7 @@ async def download_hls(
     prefer_height: int = 1080,
     audio_language: Optional[str] = None,
     subtitle_language: str = "en",
+    fetch_subtitles: bool = True,
     connections: int = _DEFAULT_CONNECTIONS,
     referer: str,
     pause: asyncio.Event,
@@ -547,6 +548,7 @@ async def download_hls(
     """Download an HLS stream (master or media playlist URL) into work_dir.
 
     Resumable: segments already present in work_dir/segments are skipped.
+    `fetch_subtitles` = False when preferred external subtitles are already available.
     `connections` = parallel segment fetches (Settings-tunable).
     `skip_ev` set = the admin pressed "Next source" (raises SourceSkipped).
     """
@@ -586,7 +588,8 @@ async def download_hls(
                 resolution = chosen.resolution
                 media_url = chosen.uri
                 audio_media = _pick_audio_media(medias, chosen.audio_group, audio_language)
-                sub_media = _pick_subtitle_media(medias, chosen.subs_group, subtitle_language)
+                if fetch_subtitles:
+                    sub_media = _pick_subtitle_media(medias, chosen.subs_group, subtitle_language)
                 if audio_media:
                     log(f"Audio track: {audio_media.name or audio_media.language or 'default'}")
                 if sub_media:
@@ -715,7 +718,7 @@ async def _download_subtitles(client: httpx.AsyncClient, url: str, referer: str,
     r = await client.get(url, headers=_headers(referer))
     r.raise_for_status()
     text = r.text
-    dest = work_dir / "subs.vtt"
+    dest = work_dir / "stream-subs.vtt"
 
     from src.subtitles import clean_vtt_text
 

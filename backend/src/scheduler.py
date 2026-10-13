@@ -194,6 +194,7 @@ def run_retention() -> None:
     if days <= 0:
         return
     cutoff = datetime.utcnow() - timedelta(days=days)
+    removed_failed_ids: list[int] = []
     with SessionLocal() as db:
         old = (
             db.query(DownloadJob)
@@ -207,10 +208,17 @@ def run_retention() -> None:
             if job.status == JobStatus.completed:
                 job.archived = True        # keep media in Library, drop from history
             else:
+                removed_failed_ids.append(job.id)
                 db.delete(job)             # failed rows are just noise
         if old:
             db.commit()
             _log.info("Retention: cleaned %d old history rows (>%d days)", len(old), days)
+    if removed_failed_ids:
+        # A retained failed workspace must not become an orphan when its
+        # history row reaches the separate history-retention deadline.
+        from src.queue.manager import download_manager
+        for job_id in removed_failed_ids:
+            download_manager.cleanup_deleted(job_id)
 
 
 async def compute_gaps(imdb_id: str, seasons: list[int] | None = None) -> list[dict]:

@@ -18,6 +18,7 @@ non-promotional cue from either end.
 from __future__ import annotations
 
 import re
+import math
 from pathlib import Path
 
 # How many cues at each end are even eligible for removal.
@@ -39,6 +40,51 @@ _AD_PATTERNS = [
 ]
 
 _TIMING_RE = re.compile(r"-->")
+_CUE_TIMING_RE = re.compile(
+    r"^\s*(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}\s+-->\s+"
+    r"(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}(?:[^\S\n].*)?$", re.M,
+)
+
+
+def has_timed_cues(text: str) -> bool:
+    """Reject empty/error responses so the next subtitle source can be tried."""
+    return _CUE_TIMING_RE.search(text) is not None
+
+
+def retime_vtt(text: str, offset: float = 0, scale: float = 1) -> str:
+    """Apply t' = t * scale + offset, preserving cue text and VTT settings."""
+    if not math.isfinite(offset) or not math.isfinite(scale) or abs(offset) > 600 or not 0.8 <= scale <= 1.25:
+        raise ValueError("Timing must use an offset within 600 seconds and a scale from 0.8 to 1.25")
+    stamp = r"(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}"
+    timing = re.compile(rf"^({stamp})[ \t]+-->[ \t]+({stamp})([^\r\n]*)$", re.M)
+
+    def seconds(value: str) -> float:
+        parts = value.split(":")
+        return sum(float(part) * 60 ** i for i, part in enumerate(reversed(parts)))
+
+    def formatted(value: float) -> str:
+        ms = max(0, round(value * 1000))
+        hours, ms = divmod(ms, 3600000)
+        minutes, ms = divmod(ms, 60000)
+        sec, ms = divmod(ms, 1000)
+        return f"{hours:02}:{minutes:02}:{sec:02}.{ms:03}"
+
+    blocks = []
+    for block in re.split(r"\n{2,}", text.replace("\r\n", "\n").strip()):
+        if block.startswith(("NOTE", "STYLE", "REGION")):
+            blocks.append(block)
+            continue
+        match = timing.search(block)
+        if match:
+            start = seconds(match[1]) * scale + offset
+            end = seconds(match[2]) * scale + offset
+            if end <= 0:
+                continue
+            start = max(0, start)
+            line = f"{formatted(start)} --> {formatted(max(start + .001, end))}{match[3]}"
+            block = block[:match.start()] + line + block[match.end():]
+        blocks.append(block)
+    return "\n\n".join(blocks) + "\n"
 
 SUBTITLE_LANGUAGES = (
     ("en", "English"), ("es", "Spanish"), ("fr", "French"),

@@ -8,7 +8,7 @@ function ResultBanner({ result }: { result: OpenVpnResult | null }) {
     <div className={`rounded-lg border px-3 py-2 text-sm ${result.ok
       ? "bg-green-900/30 border-green-700/60 text-green-200"
       : "bg-red-900/30 border-red-700/60 text-red-200"}`}>
-      <div className="font-medium">{result.ok ? "VPN connection works" : "VPN connection failed"}</div>
+      <div className="font-medium">{result.pending ? "VPN connection started" : result.ok ? "VPN connection works" : "VPN connection failed"}</div>
       <div className="text-xs opacity-90 mt-0.5">{result.message}</div>
       {result.attempts.length > 1 && (
         <div className="text-xs opacity-75 mt-1">Tried {result.attempts.length} profiles.</div>
@@ -85,7 +85,7 @@ export function OpenVpnProfiles({ setupMode = false }: { setupMode?: boolean }) 
       } else {
         setStatus(response);
       }
-      toast(kind === "enable" ? "VPN enabled" : kind === "rotate" ? "VPN rotated" : "VPN disabled", "success");
+      toast(kind === "enable" ? "VPN connection started" : kind === "rotate" ? "VPN rotation started" : "VPN disabled", "success");
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : "VPN action failed", "error");
     } finally { setBusy(""); }

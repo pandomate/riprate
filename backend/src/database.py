@@ -46,6 +46,7 @@ class JobStatus(str, enum.Enum):
     paused = "paused"
     failed = "failed"
     completed = "completed"
+    missing = "missing"         # record retained; file is absent from the library
 
 
 class MediaType(str, enum.Enum):
@@ -465,14 +466,18 @@ def _seed_admin() -> None:
 
 _SETTING_DEFAULTS = {
     "history_retention_days": "0",   # 0 = keep forever
+    # Failed download workspace cleanup: 0 = delete immediately, positive
+    # values = retain for this many hours. Restarts always purge failed temp.
+    "failed_temp_retention_hours": "0",
     "max_concurrent_downloads": "3",
     "imdb_cookie": "",               # secret; never returned in plaintext
     "imdb_cookie_set_at": "",        # ISO timestamp; drives the 4h expiry
     "watched_threshold_percent": "90",      # % watched → drops out of Continue Watching
     "stream_providers": "",                 # JSON [{key,enabled}]; "" = registry default
     "wyzie_api_key": "",                    # secret; overrides .env WYZIE_API_KEY
-    "wyzie_enabled": "true",                # subtitle downloads via Wyzie Subs
+    "wyzie_enabled": "false",               # opt-in subtitle downloads via Wyzie Subs
     "subtitle_language": "en",              # ISO-639-1 code searched for/downloaded
+    "subtitle_auto_sync": "true",           # align selected subtitles to local audio
     "tmdb_api_key": "",                     # secret; overrides .env TMDB_API_KEY
     "search_source": "tmdb",                # tmdb | imdb (search/seasons/episodes)
     "movies_folder": "Movies",              # legacy — kept in sync with media_categories
@@ -501,6 +506,7 @@ _SETTING_DEFAULTS = {
 # excluded — it's a short-lived (4h) DB-only value, not a durable .env secret.
 _SETTING_ENV_KEYS = {
     "history_retention_days": "HISTORY_RETENTION_DAYS",
+    "failed_temp_retention_hours": "FAILED_TEMP_RETENTION_HOURS",
     "max_concurrent_downloads": "MAX_CONCURRENT_DOWNLOADS",
     "segment_connections": "SEGMENT_CONNECTIONS",
     "preferred_quality": "PREFERRED_QUALITY",
@@ -512,15 +518,16 @@ _SETTING_ENV_KEYS = {
     "wyzie_api_key": "WYZIE_API_KEY",
     "wyzie_enabled": "WYZIE_ENABLED",
     "subtitle_language": "SUBTITLE_LANGUAGE",
+    "subtitle_auto_sync": "SUBTITLE_AUTO_SYNC",
 }
 
 
-def get_setting(key: str) -> str:
+def get_setting(key: str, default: str | None = None) -> str:
     with SessionLocal() as db:
         row = db.query(Setting).filter_by(key=key).first()
         if row is not None and row.value is not None:
             return row.value
-    return _SETTING_DEFAULTS.get(key, "")
+    return _SETTING_DEFAULTS.get(key, "") if default is None else default
 
 
 def set_setting(key: str, value: str) -> None:

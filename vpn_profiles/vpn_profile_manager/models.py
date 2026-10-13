@@ -91,6 +91,7 @@ class ProfileResult:
     source: Optional[dict] = None
     attempts: list[dict] = field(default_factory=list)
     at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    pending: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -102,4 +103,5 @@ class ProfileResult:
             "source": self.source,
             "attempts": self.attempts,
             "at": self.at,
+            "pending": self.pending,
         }

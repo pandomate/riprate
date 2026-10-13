@@ -55,12 +55,13 @@ from src.api.setup import router as setup_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from src.library.sync import check_media_storage, library_sync
+    check_media_storage()
     init_db()
-    # Start/re-arm the VPN before doing other startup work. The queue is
-    # gated by this step, so downloads cannot claim work while the tunnel is
-    # still reconnecting after an application restart.
-    # Start/re-arm the OpenVPN profile pool before the queue starts claiming
-    # work. The queue remains gated until a tunnel and exit IP are verified.
+    # Re-arm the OpenVPN profile pool without blocking the web server. The
+    # service closes the queue gate synchronously, then reconnects in the
+    # background so login/settings remain available when VPN networking is
+    # broken. Downloads remain gated until a tunnel and exit IP are verified.
     try:
         from src.vpn.openvpn_service import openvpn_service
         await openvpn_service.start_on_boot()
@@ -77,10 +78,14 @@ async def lifespan(app: FastAPI):
     from src.library.categories import ensure_folders
     ensure_folders()
     await download_manager.start()
+    await library_sync.start()
     await scheduler_service.start()
     try:
         yield
     finally:
+        from src.api.admin import stop_subtitle_sync_tasks
+        await stop_subtitle_sync_tasks()
+        await library_sync.stop()
         await scheduler_service.stop()
         await download_manager.stop()
         # OpenVPN starts in its own process group. Explicitly terminate it on

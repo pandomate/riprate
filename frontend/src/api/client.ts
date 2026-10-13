@@ -4,7 +4,10 @@ const BASE = "";  // same-origin — Vite proxies /api to :8000 in dev
 // showing its initial spinner forever. Reads fail quickly enough to render a
 // useful error/empty state; write operations get longer because VPN changes
 // and queue actions can legitimately take a while.
-const GET_TIMEOUT_MS = 15_000;
+// Metadata providers are allowed up to 25 seconds. Keep the browser deadline
+// above the backend deadline so users receive the backend's useful error
+// instead of a generic AbortError first.
+const GET_TIMEOUT_MS = 30_000;
 const WRITE_TIMEOUT_MS = 120_000;
 
 /** Thrown by `request()`. `detail` is the raw parsed error payload — usually
@@ -245,6 +248,22 @@ export const watch = {
   showZipUrl:          (imdb_id: string, mp4 = false) => `/api/watch/show-zip/${imdb_id}${mp4 ? "?mp4=true" : ""}`,
 };
 
+export type SubtitleSyncState = {
+  status: "idle" | "running" | "completed" | "failed";
+  message: string;
+};
+
+export const subtitleTiming = {
+  startAutoSync: (id: number) =>
+    api.post<SubtitleSyncState>(`/api/admin/subtitles/${id}/sync`),
+  syncStatus: (id: number) =>
+    api.get<SubtitleSyncState>(`/api/admin/subtitles/${id}/sync`),
+  saveOffset: (id: number, offset: number) =>
+    api.post<{ ok: boolean }>(`/api/admin/subtitles/${id}/timing`, { offset, scale: 1 }),
+  restore: (id: number) =>
+    api.post<{ ok: boolean }>(`/api/admin/subtitles/${id}/restore`),
+};
+
 // ── Sidebar badge counts (role-scoped server-side) ──────────────────────────
 
 export interface NavCounts { requests: number; downloads: number; downloading?: number }
@@ -315,7 +334,7 @@ export const download = {
 // ── Admin: queue / library / users ──────────────────────────────────────────
 
 export type JobStatus =
-  | "queued" | "downloading" | "processing" | "paused" | "completed" | "failed";
+  | "queued" | "downloading" | "processing" | "paused" | "completed" | "failed" | "missing";
 
 export interface Job {
   id: number;
@@ -526,11 +545,13 @@ export type Quality = 480 | 720 | 1080 | 1440 | 2160;
 
 export interface AppSettings {
   history_retention_days: number;
+  failed_temp_retention_hours: number;
   max_concurrent_downloads: number;
   imdb_cookie_set: boolean;
   wyzie_api_key_set: boolean;
   wyzie_enabled: boolean;
   subtitle_language: string;
+  subtitle_auto_sync: boolean;
   tmdb_api_key_set: boolean;
   search_source: SearchSource;
   watched_threshold_percent: number;
@@ -568,7 +589,7 @@ export interface OpenVpnResult {
   profile_name: string | null; public_ip: string | null;
   source: OpenVpnRemote | null;
   attempts: Array<{ profile_id: string; profile_name: string; source?: OpenVpnRemote; ok: boolean; message: string }>;
-  at: string;
+  at: string; pending: boolean;
 }
 
 function openvpnApi(base: string) {
@@ -591,11 +612,13 @@ export const setupOpenvpn = openvpnApi("/api/setup/vpn/openvpn");
 
 export interface SettingsUpdate {
   history_retention_days?: number;
+  failed_temp_retention_hours?: number;
   max_concurrent_downloads?: number;
   imdb_cookie?: string;   // write-only; never returned
   wyzie_api_key?: string; // write-only; never returned
   wyzie_enabled?: boolean;
   subtitle_language?: string;
+  subtitle_auto_sync?: boolean;
   tmdb_api_key?: string;  // write-only; never returned
   search_source?: SearchSource;
   watched_threshold_percent?: number;

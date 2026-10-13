@@ -1,7 +1,9 @@
+import asyncio
 import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -30,7 +32,22 @@ class SearchResultOut(BaseModel):
 
 @router.get("/search")
 async def search(q: str = Query(..., min_length=1), _user=Depends(require_auth)):
-    results = await meta.search(q)
+    try:
+        # Always finish before the frontend's request deadline. In particular,
+        # DNS failures inside Docker must become a useful API response instead
+        # of leaving the browser to report a generic timeout.
+        results = await asyncio.wait_for(meta.search(q), timeout=25)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="The search provider timed out. If VPN is enabled, wait for it to connect and try again.",
+        ) from exc
+    except httpx.RequestError as exc:
+        _log.warning("[search] provider network error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="The search provider is unreachable. Check the VPN status and Docker internet connection.",
+        ) from exc
     return [
         SearchResultOut(
             imdb_id=r.imdb_id,

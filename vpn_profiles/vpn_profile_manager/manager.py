@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import random
 import signal
@@ -17,10 +18,30 @@ StateCallback = Callable[[bool], Awaitable[None]]
 PublicIpChecker = Callable[[float], Awaitable[str | None]]
 
 _IP_ECHO = (
+    # DNS can be temporarily unavailable while OpenVPN replaces the default
+    # route. Cloudflare serves a TLS-valid trace endpoint directly on 1.1.1.1,
+    # giving verification a DNS-independent path through the tunnel.
+    "https://1.1.1.1/cdn-cgi/trace",
     "https://ipv4.icanhazip.com",
-    "https://api-ipv4.ipify.org",
-    "https://v4.ident.me",
+    "https://api.ipify.org",
+    "https://4.ident.me",
 )
+
+
+def _parse_public_ipv4(value: str) -> str | None:
+    """Extract an IPv4 address from a plain-IP or Cloudflare trace response."""
+    candidates = [value.strip()]
+    candidates.extend(
+        line[3:].strip() for line in value.splitlines() if line.startswith("ip=")
+    )
+    for candidate in candidates:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.version == 4 and address.is_global:
+            return str(address)
+    return None
 
 
 class OpenVPNProfileManager:
@@ -118,15 +139,12 @@ class OpenVPNProfileManager:
             def request() -> str:
                 req = urllib.request.Request(url, headers={"User-Agent": "vpn-profile-manager/0.1"})
                 with opener.open(req, timeout=timeout) as response:
-                    return response.read(128).decode("ascii", errors="ignore").strip()
+                    return response.read(2048).decode("ascii", errors="ignore").strip()
             try:
                 value = await asyncio.to_thread(request)
-                parts = value.split(".")
-                if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-                    return value
+                return _parse_public_ipv4(value)
             except Exception:
                 return None
-            return None
 
         tasks = [asyncio.create_task(one(url)) for url in self.ip_echo_urls]
         try:

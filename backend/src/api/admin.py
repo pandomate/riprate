@@ -18,7 +18,6 @@ from src.database import AuditLog, DownloadJob, JobStatus, SessionLocal, User, g
 from src.library.categories import all_categories, get_category, save_categories
 from src.subtitles import normalize_language
 from src.providers.base import configured_providers, enabled_provider_meta, resolve_one
-from src.providers import wyzie
 from src.queue.manager import download_manager
 from src.security import audit, client_ip
 
@@ -83,6 +82,107 @@ def _queue_jobs(db: Session) -> list[DownloadJob]:
 
 
 # ── SSE live stream ────────────────────────────────────────────────────────
+
+_subtitle_sync_tasks: dict[int, asyncio.Task] = {}
+_subtitle_sync_states: dict[int, dict] = {}
+
+
+async def stop_subtitle_sync_tasks():
+    tasks = list(_subtitle_sync_tasks.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _subtitle_files(job_id: int, db: Session) -> tuple[Path, Path]:
+    from src.api.watch import _job_file, _sidecar, _inside_media_dir
+    video = _job_file(db, job_id)
+    sidecar = _sidecar(video)
+    if sidecar is None or not _inside_media_dir(sidecar):
+        raise HTTPException(status_code=404, detail="No external subtitle file")
+    return video, sidecar
+
+
+async def _sync_existing_subtitle(job_id: int, video: Path, sidecar: Path):
+    from src.subtitle_sync import align_subtitles, replace_sidecar
+    state = _subtitle_sync_states[job_id]
+    try:
+        with tempfile.TemporaryDirectory(prefix="riprate-sync-existing-") as work:
+            original = sidecar.read_text(encoding="utf-8")
+            source, output = Path(work) / "source.vtt", Path(work) / "aligned.vtt"
+            source.write_text(original, encoding="utf-8")
+            ok = await align_subtitles(video, source, output,
+                                      log=lambda message: state.update(message=message))
+            if not ok:
+                state["status"] = "failed"
+                return
+            if not video.exists() or not sidecar.exists() or sidecar.read_text(encoding="utf-8") != original:
+                state.update(status="failed", message="The media or subtitles changed during alignment. Try again.")
+                return
+            replace_sidecar(sidecar, output.read_text(encoding="utf-8"))
+            state.update(status="completed", message="External subtitles aligned. Reload the subtitle track in other players.")
+    except asyncio.CancelledError:
+        state.update(status="failed", message="Subtitle alignment was interrupted")
+        raise
+    except Exception as exc:
+        _log.warning("Subtitle alignment for job %s failed: %s", job_id, type(exc).__name__)
+        state.update(status="failed", message="Could not align subtitles; the original was kept.")
+    finally:
+        _subtitle_sync_tasks.pop(job_id, None)
+
+
+@router.post("/subtitles/{job_id}/sync")
+async def sync_subtitles(job_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    video, sidecar = _subtitle_files(job_id, db)
+    if job_id not in _subtitle_sync_tasks:
+        if len(_subtitle_sync_tasks) >= 4:
+            raise HTTPException(status_code=429, detail="Subtitle alignment queue is full; try again shortly")
+        # Keep the in-memory completion reports bounded.
+        for key in list(_subtitle_sync_states)[:-50]:
+            if key not in _subtitle_sync_tasks:
+                _subtitle_sync_states.pop(key)
+        _subtitle_sync_states[job_id] = {"status": "running", "message": "Waiting to align subtitles to audio…"}
+        _subtitle_sync_tasks[job_id] = asyncio.create_task(_sync_existing_subtitle(job_id, video, sidecar))
+    return _subtitle_sync_states[job_id]
+
+
+@router.get("/subtitles/{job_id}/sync")
+def subtitle_sync_status(job_id: int, _admin=Depends(require_admin)):
+    return _subtitle_sync_states.get(job_id, {"status": "idle", "message": "No alignment is running"})
+
+
+class SubtitleTiming(BaseModel):
+    offset: float = Field(default=0, ge=-600, le=600, allow_inf_nan=False)
+    scale: float = Field(default=1, ge=.8, le=1.25, allow_inf_nan=False)
+
+
+@router.post("/subtitles/{job_id}/timing")
+def save_subtitle_timing(job_id: int, body: SubtitleTiming,
+                        db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    if job_id in _subtitle_sync_tasks:
+        raise HTTPException(status_code=409, detail="Wait for subtitle alignment to finish")
+    _, sidecar = _subtitle_files(job_id, db)
+    from src.subtitles import retime_vtt, has_timed_cues
+    from src.subtitle_sync import replace_sidecar
+    text = retime_vtt(sidecar.read_text(encoding="utf-8"), body.offset, body.scale)
+    if not has_timed_cues(text):
+        raise HTTPException(status_code=422, detail="This adjustment removes all subtitle cues")
+    replace_sidecar(sidecar, text)
+    return {"ok": True}
+
+
+@router.post("/subtitles/{job_id}/restore")
+def restore_subtitle_timing(job_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    if job_id in _subtitle_sync_tasks:
+        raise HTTPException(status_code=409, detail="Wait for subtitle alignment to finish")
+    _, sidecar = _subtitle_files(job_id, db)
+    backup = sidecar.with_suffix(sidecar.suffix + ".before-sync")
+    from src.api.watch import _inside_media_dir
+    if not backup.is_file() or not _inside_media_dir(backup):
+        raise HTTPException(status_code=404, detail="No original subtitle backup is available")
+    from src.library.organizer import _atomic_write_text
+    _atomic_write_text(sidecar, backup.read_text(encoding="utf-8"))
+    return {"ok": True}
 
 @router.get("/stream")
 async def stream_queue(_admin=Depends(require_admin)):
@@ -268,6 +368,7 @@ def get_audit(
 
 class SettingsUpdate(BaseModel):
     history_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    failed_temp_retention_hours: Optional[int] = Field(default=None, ge=0, le=87600)
     max_concurrent_downloads: Optional[int] = Field(default=None, ge=1, le=10)
     imdb_cookie: Optional[str] = Field(default=None, max_length=8000)
     watched_threshold_percent: Optional[int] = Field(default=None, ge=50, le=100)
@@ -275,6 +376,7 @@ class SettingsUpdate(BaseModel):
     wyzie_api_key: Optional[str] = Field(default=None, max_length=200)
     wyzie_enabled: Optional[bool] = None
     subtitle_language: Optional[str] = Field(default=None, max_length=16)
+    subtitle_auto_sync: Optional[bool] = None
     tmdb_api_key: Optional[str] = Field(default=None, max_length=500)
     search_source: Optional[str] = Field(default=None, pattern="^(tmdb|imdb)$")
     movies_folder: Optional[str] = Field(default=None, max_length=120)
@@ -295,12 +397,14 @@ def _settings_payload() -> dict:
     cookie_set = bool((s.get("imdb_cookie") or "").strip() or cfg.imdb_cookie)
     return {
         "history_retention_days": int(s.get("history_retention_days", "0") or 0),
+        "failed_temp_retention_hours": int(s.get("failed_temp_retention_hours", "0") or 0),
         "max_concurrent_downloads": download_manager.max_slots,
         # Secrets — never returned in plaintext, only whether one is configured
         "imdb_cookie_set": cookie_set,
         "wyzie_api_key_set": bool(wyzie.effective_key()),
-        "wyzie_enabled": (s.get("wyzie_enabled", "true") or "true").lower() != "false",
+        "wyzie_enabled": wyzie.preference_enabled(),
         "subtitle_language": normalize_language(s.get("subtitle_language") or "en"),
+        "subtitle_auto_sync": s.get("subtitle_auto_sync", "true").lower() in ("true", "1", "yes", "on"),
         "tmdb_api_key_set": tmdb.has_key(),
         "watched_threshold_percent": int(s.get("watched_threshold_percent", "90") or 90),
         "stream_providers": configured_providers(),
@@ -336,6 +440,14 @@ async def update_settings(
         set_setting("history_retention_days", str(body.history_retention_days))
         audit(db, "settings.updated", username=admin.username,
               detail=f"history_retention_days={body.history_retention_days}", ip=client_ip(request))
+    if body.failed_temp_retention_hours is not None:
+        hours = body.failed_temp_retention_hours
+        set_setting("failed_temp_retention_hours", str(hours))
+        audit(db, "settings.updated", username=admin.username,
+              detail=f"failed_temp_retention_hours={hours}", ip=client_ip(request))
+        # Apply a stricter policy immediately instead of waiting for the next
+        # periodic cleanup pass.
+        await download_manager.cleanup_failed_temp_files()
     if body.max_concurrent_downloads is not None:
         n = await download_manager.set_concurrency(body.max_concurrent_downloads)
         set_setting("max_concurrent_downloads", str(n))
@@ -393,6 +505,10 @@ async def update_settings(
         set_setting("subtitle_language", lang)
         audit(db, "settings.updated", username=admin.username,
               detail=f"subtitle_language={lang}", ip=client_ip(request))
+    if body.subtitle_auto_sync is not None:
+        set_setting("subtitle_auto_sync", "true" if body.subtitle_auto_sync else "false")
+        audit(db, "settings.updated", username=admin.username,
+              detail=f"subtitle_auto_sync={body.subtitle_auto_sync}", ip=client_ip(request))
     if body.tmdb_api_key is not None:
         key = body.tmdb_api_key.strip()
         if not key:
@@ -1144,6 +1260,8 @@ async def retry_subtitles(
     _admin=Depends(require_admin),
 ):
     """Fetch subtitles for an existing completed video without re-downloading it."""
+    if job_id in _subtitle_sync_tasks:
+        raise HTTPException(status_code=409, detail="Wait for subtitle alignment to finish")
     job = db.query(DownloadJob).filter_by(id=job_id, status=JobStatus.completed).first()
     if not job or not job.file_path:
         raise HTTPException(status_code=404, detail="Completed download not found")
@@ -1160,9 +1278,9 @@ async def retry_subtitles(
     temp_dir = Path(tempfile.mkdtemp(prefix=f"subtitle-retry-{job.id}-",
                                       dir=str(tmp_root)))
     try:
-        found = None
-        source_label = None
-        for provider in enabled_provider_meta():
+        found = await download_manager._download_wyzie_vtt(job, temp_dir, language)
+        source_label = "Wyzie" if found is not None else None
+        for provider in enabled_provider_meta() if found is None else []:
             try:
                 sources = await resolve_one(
                     provider["key"], job.imdb_id, job.media_type,
@@ -1180,15 +1298,6 @@ async def retry_subtitles(
                 _log.info("Subtitle retry via %s failed for job %s: %s",
                           provider["label"], job.id, exc)
 
-        if found is None and wyzie.is_enabled():
-            found = await wyzie.download_subtitle(
-                job.imdb_id, temp_dir / "subs.vtt",
-                season=job.season, episode=job.episode,
-                language=language,
-            )
-            if found:
-                source_label = "Wyzie"
-
         if found is None:
             raise HTTPException(
                 status_code=404,
@@ -1196,6 +1305,12 @@ async def retry_subtitles(
             )
 
         sidecar.parent.mkdir(parents=True, exist_ok=True)
+        from src.subtitle_sync import align_subtitles, auto_sync_enabled
+        if auto_sync_enabled():
+            aligned = temp_dir / "aligned.vtt"
+            if await align_subtitles(video, found, aligned,
+                                     log=lambda m: download_manager.log_job(job_id, m), timeout=90):
+                found = aligned
         shutil.copyfile(found, sidecar)
         job.subtitle_path = str(sidecar)
         db.commit()

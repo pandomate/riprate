@@ -122,14 +122,19 @@ function PasswordSection() {
 function AdminSettingsSection() {
   const toast = useToast();
   const [retention, setRetention] = useState("0");
+  const [failedTempMode, setFailedTempMode] = useState<"immediate" | "timed">("immediate");
+  const [failedTempAmount, setFailedTempAmount] = useState("24");
+  const [failedTempUnit, setFailedTempUnit] = useState<"hours" | "days">("hours");
   const [concurrency, setConcurrency] = useState(3);
   const [cookieSet, setCookieSet] = useState(false);
   const [cookie, setCookie] = useState("");
   const [watchedPct, setWatchedPct] = useState(90);
   const [providers, setProviders] = useState<StreamProvider[]>([]);
   const [wyzieSet, setWyzieSet] = useState(false);
-  const [wyzieOn, setWyzieOn] = useState(true);
+  const [wyzieOn, setWyzieOn] = useState(false);
+  const [savingWyzieToggle, setSavingWyzieToggle] = useState(false);
   const [subtitleLanguage, setSubtitleLanguage] = useState("en");
+  const [subtitleAutoSync, setSubtitleAutoSync] = useState(true);
   const [wyzieKey, setWyzieKey] = useState("");
   const [tmdbSet, setTmdbSet] = useState(false);
   const [tmdbKey, setTmdbKey] = useState("");
@@ -145,6 +150,7 @@ function AdminSettingsSection() {
   const [savingEnc, setSavingEnc] = useState(false);
   const [loading, setLoading] = useState(true);
   const [savingR, setSavingR] = useState(false);
+  const [savingFailedTemp, setSavingFailedTemp] = useState(false);
   const [savingC, setSavingC] = useState(false);
   const [savingK, setSavingK] = useState(false);
   const [savingW, setSavingW] = useState(false);
@@ -155,6 +161,18 @@ function AdminSettingsSection() {
   useEffect(() => {
     settingsApi.get().then((s) => {
       setRetention(String(s.history_retention_days));
+      if (s.failed_temp_retention_hours === 0) {
+        setFailedTempMode("immediate");
+      } else {
+        setFailedTempMode("timed");
+        if (s.failed_temp_retention_hours % 24 === 0) {
+          setFailedTempUnit("days");
+          setFailedTempAmount(String(s.failed_temp_retention_hours / 24));
+        } else {
+          setFailedTempUnit("hours");
+          setFailedTempAmount(String(s.failed_temp_retention_hours));
+        }
+      }
       setConcurrency(s.max_concurrent_downloads);
       setCookieSet(s.imdb_cookie_set);
       setWatchedPct(s.watched_threshold_percent);
@@ -162,6 +180,7 @@ function AdminSettingsSection() {
       setWyzieSet(s.wyzie_api_key_set);
       setWyzieOn(s.wyzie_enabled);
       setSubtitleLanguage(s.subtitle_language || "en");
+      setSubtitleAutoSync(s.subtitle_auto_sync ?? true);
       setTmdbSet(s.tmdb_api_key_set);
       setSearchSource(s.search_source);
       setMediaRoot(s.media_root);
@@ -208,6 +227,19 @@ function AdminSettingsSection() {
       toast("Subtitle language saved", "success");
     } catch (err: unknown) {
       setSubtitleLanguage(prev);
+      toast(err instanceof Error ? err.message : "Save failed", "error");
+    }
+  };
+
+  const toggleSubtitleAutoSync = async () => {
+    const next = !subtitleAutoSync;
+    setSubtitleAutoSync(next);
+    try {
+      const s = await settingsApi.update({ subtitle_auto_sync: next });
+      setSubtitleAutoSync(s.subtitle_auto_sync);
+      toast(next ? "Automatic subtitle alignment enabled" : "Automatic subtitle alignment disabled", "success");
+    } catch (err: unknown) {
+      setSubtitleAutoSync(!next);
       toast(err instanceof Error ? err.message : "Save failed", "error");
     }
   };
@@ -261,15 +293,18 @@ function AdminSettingsSection() {
   };
 
   const toggleWyzie = async () => {
+    if (savingWyzieToggle) return;
     const on = !wyzieOn;
+    setSavingWyzieToggle(true);
     setWyzieOn(on);   // optimistic
     try {
       const s = await settingsApi.update({ wyzie_enabled: on });
       setWyzieOn(s.wyzie_enabled);
+      toast(on ? "Wyzie enabled — preferred subtitle source" : "Wyzie disabled — using stream subtitles", "success");
     } catch (err: unknown) {
       setWyzieOn(!on);
       toast(err instanceof Error ? err.message : "Save failed", "error");
-    }
+    } finally { setSavingWyzieToggle(false); }
   };
 
   const saveTmdbKey = async (value: string) => {
@@ -307,6 +342,30 @@ function AdminSettingsSection() {
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : "Save failed", "error");
     } finally { setSavingR(false); }
+  };
+
+  const saveFailedTempRetention = async () => {
+    const amount = Math.max(1, Math.floor(Number(failedTempAmount) || 1));
+    const hours = failedTempMode === "immediate" ? 0
+      : Math.min(87600, amount * (failedTempUnit === "days" ? 24 : 1));
+    setSavingFailedTemp(true);
+    try {
+      const s = await settingsApi.update({ failed_temp_retention_hours: hours });
+      const saved = s.failed_temp_retention_hours;
+      setFailedTempMode(saved === 0 ? "immediate" : "timed");
+      if (saved > 0) {
+        if (saved % 24 === 0) {
+          setFailedTempUnit("days");
+          setFailedTempAmount(String(saved / 24));
+        } else {
+          setFailedTempUnit("hours");
+          setFailedTempAmount(String(saved));
+        }
+      }
+      toast("Failed download cleanup saved", "success");
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : "Save failed", "error");
+    } finally { setSavingFailedTemp(false); }
   };
 
   const saveConcurrency = async (n: number) => {
@@ -384,6 +443,19 @@ function AdminSettingsSection() {
           onChange={(e) => saveSubtitleLanguage(e.target.value)}>
           {SUBTITLE_OPTIONS.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
         </select>
+        <div className="flex items-center gap-3 pt-3 border-t border-gray-800">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-gray-200">Align subtitles to audio</div>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Corrects fixed delays and release timing differences locally before new downloads are saved.
+            </p>
+          </div>
+          <button role="switch" aria-label="Automatically align subtitles to audio"
+            aria-checked={subtitleAutoSync} onClick={toggleSubtitleAutoSync}
+            className={`relative w-11 h-6 rounded-full flex-shrink-0 ml-auto transition-colors ${subtitleAutoSync ? "bg-sky-600" : "bg-gray-700"}`}>
+            <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${subtitleAutoSync ? "left-[22px]" : "left-0.5"}`} />
+          </button>
+        </div>
       </div>
 
       <div className="card space-y-3">
@@ -542,6 +614,48 @@ function AdminSettingsSection() {
         </p>
       </div>
 
+      <div className="card space-y-3">
+        <h2 className="font-semibold">Failed download temp files</h2>
+        <p className="text-sm text-gray-500">
+          Choose how long incomplete video pieces are kept after a download fails. Retained files
+          can be reused if the job is retried. Cancelling or deleting a job still removes its temp files.
+        </p>
+        <div className="space-y-2">
+          <label className="flex items-center gap-2 text-sm text-gray-300">
+            <input type="radio" name="failed_temp_mode" className="accent-sky-500"
+              checked={failedTempMode === "immediate"}
+              onChange={() => setFailedTempMode("immediate")} />
+            Delete all temp files immediately when a download fails
+          </label>
+          <label className="flex items-center gap-2 text-sm text-gray-300">
+            <input type="radio" name="failed_temp_mode" className="accent-sky-500"
+              checked={failedTempMode === "timed"}
+              onChange={() => setFailedTempMode("timed")} />
+            Delete temp files after
+          </label>
+          {failedTempMode === "timed" && (
+            <div className="flex gap-2 pl-6">
+              <input className="input w-28" type="number" min={1}
+                max={failedTempUnit === "days" ? 3650 : 87600}
+                value={failedTempAmount} onChange={(e) => setFailedTempAmount(e.target.value)} />
+              <select className="input w-28" value={failedTempUnit}
+                onChange={(e) => setFailedTempUnit(e.target.value as "hours" | "days")}>
+                <option value="hours">Hours</option>
+                <option value="days">Days</option>
+              </select>
+            </div>
+          )}
+        </div>
+        <button className="btn-primary" onClick={saveFailedTempRetention}
+          disabled={savingFailedTemp}>
+          {savingFailedTemp ? "Saving…" : "Save"}
+        </button>
+        <p className="text-xs text-gray-600">
+          Restarting RipRate with start.sh always removes failed jobs and their temp files. During
+          a server run, cleanup also runs when this setting changes and every 15 minutes.
+        </p>
+      </div>
+
       <GroupHeading>Metadata &amp; subtitles</GroupHeading>
 
       <div className="card space-y-3">
@@ -641,18 +755,23 @@ function AdminSettingsSection() {
             ? <span className="badge-completed">key configured</span>
             : <span className="badge-neutral">no key</span>}
           <button
-            role="switch" aria-checked={wyzieOn}
+            role="switch" aria-label="Enable Wyzie subtitles" aria-checked={wyzieOn}
+            disabled={savingWyzieToggle} aria-busy={savingWyzieToggle}
             onClick={toggleWyzie} title={wyzieOn ? "Disable Wyzie" : "Enable Wyzie"}
             className={`relative w-11 h-6 rounded-full flex-shrink-0 transition-colors ml-auto ${wyzieOn ? "bg-sky-600" : "bg-gray-700"}`}>
             <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${wyzieOn ? "left-[22px]" : "left-0.5"}`} />
           </button>
         </div>
+        <p className="text-sm text-gray-300" role="status">
+          {wyzieOn && wyzieSet ? "Active: Wyzie first, with stream provider fallback."
+            : wyzieOn ? "Add an API key to activate Wyzie. Currently using stream provider subtitles."
+            : "Wyzie disabled. Using stream provider subtitles."}
+        </p>
         <p className="text-sm text-gray-500">
-          Fetches English subtitles from <span className="font-mono text-gray-400">sub.wyzie.io</span> when
-          a download's stream has none. Needs a free API key
-          (no account) from <span className="font-mono text-gray-400">store.wyzie.io/redeem</span> — the
-          free plan allows 1,000 requests/day. Without a key (or with the toggle off) subtitles
-          simply fall back to what the stream provides.
+          When enabled with an API key, Wyzie is tried first for subtitles in your selected language,
+          including subtitle retries. If Wyzie has no result or fails, RipRate uses stream provider
+          subtitles. When disabled or without a key, only stream provider subtitles are used.
+          Get a free API key from <span className="font-mono text-gray-400">store.wyzie.io/redeem</span>.
         </p>
         <div className="flex items-end gap-2">
           <div className="flex-1">

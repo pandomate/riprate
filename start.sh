@@ -19,23 +19,15 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 # ── Install Docker if missing ─────────────────────────────────────────────
-if ! command -v docker &>/dev/null; then
+# Docker Desktop can add a Windows docker.exe to PATH inside WSL.  That is
+# not a native Linux Docker installation, so do not treat it as Docker here.
+DOCKER_BIN="$(command -v docker 2>/dev/null || true)"
+if [[ -z "$DOCKER_BIN" || "$DOCKER_BIN" == /mnt/* || "$DOCKER_BIN" == *.exe ]]; then
   echo "[riprate] Docker not found — installing…"
   if command -v apt-get &>/dev/null; then
-    # Debian/Ubuntu
+    # Debian/Ubuntu: install the native Linux engine and Compose.
     $_SUDO apt-get update -q
-    $_SUDO apt-get install -y -q ca-certificates curl gnupg lsb-release
-    $_SUDO install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg \
-      | $_SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    $_SUDO chmod a+r /etc/apt/keyrings/docker.gpg
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-      https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") \
-      $(lsb_release -cs) stable" \
-      | $_SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
-    $_SUDO apt-get update -q
-    $_SUDO apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    $_SUDO apt-get install -y -q docker.io docker-compose
   elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
     # RHEL/CentOS/Fedora
     _PKG=$(command -v dnf &>/dev/null && echo dnf || echo yum)
@@ -46,32 +38,55 @@ if ! command -v docker &>/dev/null; then
     echo "[riprate] Using Docker's convenience install script…"
     curl -fsSL https://get.docker.com | $_SUDO sh
   fi
+  hash -r
   # Add current user to docker group so they can run docker without sudo
   $_SUDO usermod -aG docker "$USER" 2>/dev/null || true
   echo "[riprate] ✓ Docker installed."
 fi
 
+# Use sudo for Docker during this run when the daemon is available but the
+# current shell has not picked up its newly-added docker group membership yet.
+DOCKER=(docker)
+DOCKER_USES_SUDO=0
+if ! "${DOCKER[@]}" info &>/dev/null 2>&1 \
+    && [[ -n "$_SUDO" ]] && $_SUDO docker info &>/dev/null 2>&1; then
+  DOCKER=($_SUDO docker)
+  DOCKER_USES_SUDO=1
+  echo "[riprate] Docker is running; using sudo until your next login refreshes group membership."
+fi
+
 # ── Start Docker daemon if it's not already running ──────────────────────
-if ! docker info &>/dev/null 2>&1; then
+if ! "${DOCKER[@]}" info &>/dev/null 2>&1; then
   echo "[riprate] Docker daemon not running — starting it…"
-  if command -v service &>/dev/null; then
-    $_SUDO service docker start
-  elif command -v systemctl &>/dev/null; then
+  if [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null; then
     $_SUDO systemctl start docker
+  elif command -v service &>/dev/null && [[ -x /usr/sbin/service ]] \
+      && ! ( [[ -r /proc/version ]] && grep -qi microsoft /proc/version ); then
+    $_SUDO service docker start
   else
-    # WSL2 / no init system fallback
+    # Systems without an init system (including WSL without systemd).
     $_SUDO dockerd > /tmp/dockerd.log 2>&1 &
     echo "[riprate] Started dockerd in background (log: /tmp/dockerd.log)"
   fi
   # Wait up to 15 s for the daemon to become ready
   for i in $(seq 1 15); do
-    docker info &>/dev/null 2>&1 && break
+    if docker info &>/dev/null 2>&1; then
+      break
+    elif [[ -n "$_SUDO" ]] && $_SUDO docker info &>/dev/null 2>&1; then
+      DOCKER=($_SUDO docker)
+      DOCKER_USES_SUDO=1
+      break
+    fi
     sleep 1
   done
-  if ! docker info &>/dev/null 2>&1; then
+  if ! "${DOCKER[@]}" info &>/dev/null 2>&1; then
     echo "[riprate] ⚠  Docker daemon did not start in time."
-    echo "           Try: sudo service docker start   (or: sudo systemctl start docker)"
-    echo "           Then re-run this script."
+    if [[ -s /tmp/dockerd.log ]]; then
+      echo "           Last dockerd log lines:"
+      tail -n 20 /tmp/dockerd.log | sed 's/^/           /'
+    elif command -v systemctl &>/dev/null; then
+      $_SUDO systemctl status docker --no-pager 2>/dev/null || true
+    fi
     exit 1
   fi
   echo "[riprate] ✓ Docker daemon is running."
@@ -81,7 +96,7 @@ fi
 if ! docker compose version &>/dev/null 2>&1 && ! command -v docker-compose &>/dev/null; then
   echo "[riprate] docker compose not found — installing plugin…"
   if command -v apt-get &>/dev/null; then
-    $_SUDO apt-get install -y -q docker-compose-plugin
+    $_SUDO apt-get install -y -q docker-compose
   else
     # Standalone binary fallback
     ARCH=$(uname -m)
@@ -95,9 +110,13 @@ fi
 
 # Resolve compose command
 if docker compose version &>/dev/null 2>&1; then
-  DC="docker compose"
+  DC=("${DOCKER[@]}" compose)
 elif command -v docker-compose &>/dev/null; then
-  DC="docker-compose"
+  if [[ "$DOCKER_USES_SUDO" == "1" ]]; then
+    DC=($_SUDO docker-compose)
+  else
+    DC=(docker-compose)
+  fi
 else
   echo "[riprate] ⚠  Could not find docker compose. Please install it manually."
   exit 1
@@ -134,10 +153,21 @@ fi
 
 # ── Ensure the host media directory exists ───────────────────────────────
 # MEDIA_DIR is the HOST path bound to /media/library inside the container.
-# Defaults to ./media/library (under the project) to match docker-compose.yml.
+# Defaults to ./media (under the project) to match docker-compose.yml.
 cd "$ROOT"
-MEDIA_DIR="${MEDIA_DIR:-./media/library}"
+MEDIA_DIR="${MEDIA_DIR:-./media}"
+# A missing network drive must not turn into a local library directory.
+if [[ -n "${MEDIA_MOUNT:-}" ]] && ! mountpoint -q "$MEDIA_MOUNT"; then
+  echo "[riprate] Media mount is unavailable: $MEDIA_MOUNT"
+  echo "           Mount the drive before starting RipRate."
+  exit 1
+fi
 mkdir -p "$MEDIA_DIR"
+export MEDIA_DIR
+if [[ -z "${MEDIA_EXPECTED_FSTYPE:-}" ]] && command -v findmnt &>/dev/null; then
+  MEDIA_EXPECTED_FSTYPE="$(findmnt -n -o FSTYPE -T "$MEDIA_DIR")"
+fi
+export MEDIA_EXPECTED_FSTYPE="${MEDIA_EXPECTED_FSTYPE:-}"
 echo "[riprate] Media directory (host): $MEDIA_DIR  →  /media/library in the container"
 
 # Drop any stale auto-generated compose override left by the old MOUNT_* feature
@@ -156,24 +186,54 @@ fi
 cd "$ROOT"
 if [[ "${1:-}" == "--fresh" ]]; then
   echo "[riprate] --fresh: removing containers AND volumes (database will be wiped)…"
-  $DC down -v --remove-orphans
+  "${DC[@]}" down -v --remove-orphans
   # Admin accounts live ONLY in the database, so wiping it is all it takes to
   # land back on the setup wizard — nothing in .env to clear. Also drop any
   # stale on-disk SQLite left by a mis-set DATABASE_URL, just in case.
   rm -f "$ROOT/backend/riprate.db" "$ROOT/backend/riprate.db-shm" "$ROOT/backend/riprate.db-wal"
 else
   echo "[riprate] Removing old containers (database and media are kept)…"
-  $DC down --remove-orphans
+  "${DC[@]}" down --remove-orphans
 fi
-docker image prune -f > /dev/null 2>&1 || true
+"${DOCKER[@]}" image prune -f > /dev/null 2>&1 || true
 
 echo "[riprate] Building and starting containers…"
-$DC up --build -d
+"${DC[@]}" up --build -d
+
+# Recreating containers attaches the current host mount. Compare the actual
+# directory identity so a stale Docker mount cannot pass unnoticed.
+_MEDIA_HOST_ID="$(stat -c '%d:%i' "$MEDIA_DIR")"
+_MEDIA_CONTAINER_ID="$("${DC[@]}" exec -T backend stat -c '%d:%i' /media/library)"
+if [[ "$_MEDIA_HOST_ID" != "$_MEDIA_CONTAINER_ID" ]]; then
+  echo "[riprate] Host MEDIA_DIR and Docker media directory do not match."
+  echo "           Check the Docker context and host mount, then recreate the backend."
+  "${DC[@]}" stop backend
+  exit 1
+fi
+
+echo "[riprate] Waiting for the app at http://127.0.0.1:5173…"
+_frontend_ready=0
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 2 http://127.0.0.1:5173/api/setup/status >/dev/null 2>&1; then
+    _frontend_ready=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$_frontend_ready" != "1" ]]; then
+  echo "[riprate] ⚠  RipRate did not become ready on port 5173."
+  echo "[riprate] Container status:"
+  "${DC[@]}" ps -a || true
+  echo "[riprate] Recent frontend/backend logs:"
+  "${DC[@]}" logs --tail=80 frontend backend || true
+  exit 1
+fi
 
 echo ""
 echo "[riprate] ✓ RipRate is running."
-echo "           Frontend → http://localhost:5173"
-echo "           Backend  → http://localhost:8000"
+echo "           Frontend → http://127.0.0.1:5173"
+echo "           API      → http://127.0.0.1:5173/api"
 echo ""
-echo "  Tail logs: $DC logs -f"
-echo "  Stop:      $DC down"
+echo "  Tail logs: ${DC[*]} logs -f"
+echo "  Stop:      ${DC[*]} down"

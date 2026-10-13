@@ -30,7 +30,7 @@ import time
 import httpx
 from sqlalchemy import func
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _log = logging.getLogger("queue")
@@ -38,7 +38,7 @@ _log = logging.getLogger("queue")
 from src.config import settings
 from src.database import DownloadJob, JobStatus, SessionLocal, get_setting, set_setting
 from src.library.organizer import ensure_parent, episode_path, movie_path, subtitle_sidecar_path
-from src.subtitles import clean_vtt_text, language_matches, normalize_language
+from src.subtitles import clean_vtt_text, has_timed_cues, language_matches, normalize_language
 from src.providers.nova import _REFERER as NOVA_REFERER, _USER_AGENT as NOVA_USER_AGENT
 from src.providers.base import resolve_with_registry
 from src.providers import wyzie
@@ -98,11 +98,12 @@ _STREAM_HEADERS = {"User-Agent": NOVA_USER_AGENT, "Accept": "*/*"}
 class UnplayableSource(Exception):
     """The source downloaded bytes but did not decode to usable video."""
 
-# A failed job is terminal.  Keeping its segment workspace made every failed
-# retry leave another numbered directory behind, eventually filling the data
-# volume.  Retries start cleanly; only interrupted/paused work is resumable.
+# Interrupted and paused work is always resumable. Failed workspaces follow the
+# admin's retention setting and can also be reused by a retry while retained.
 _RESUMABLE = (JobStatus.queued, JobStatus.downloading, JobStatus.processing,
               JobStatus.paused)
+
+_FAILED_TEMP_CLEANUP_INTERVAL = 15 * 60
 
 
 def _fmt_speed(bps: float) -> str:
@@ -166,6 +167,7 @@ class DownloadManager:
         self._maint_depth = 0      # re-entrant begin/end_maintenance
         self._net_paused_jobs: set[int] = set()   # jobs WE paused on an outage
         self._net_task: asyncio.Task | None = None
+        self._failed_temp_task: asyncio.Task | None = None
         self._last_progress_at = time.monotonic()  # last time ANY download got bytes
         self._net_down_at = 0.0                     # when the connection went down
 
@@ -194,6 +196,7 @@ class DownloadManager:
         for i in range(n):
             self._workers[i] = asyncio.create_task(self._worker(i))
         self._net_task = asyncio.create_task(self._network_monitor())
+        self._failed_temp_task = asyncio.create_task(self._failed_temp_cleanup_loop())
 
     async def stop(self) -> None:
         self._target_workers = 0
@@ -203,6 +206,69 @@ class DownloadManager:
         if self._net_task is not None:
             self._net_task.cancel()
             self._net_task = None
+        if self._failed_temp_task is not None:
+            self._failed_temp_task.cancel()
+            self._failed_temp_task = None
+
+    def _failed_temp_retention_hours(self) -> int:
+        try:
+            value = int(get_setting("failed_temp_retention_hours") or "0")
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(87600, value))
+
+    async def _failed_temp_cleanup_loop(self) -> None:
+        """Clean expired failed workspaces at startup and while the app runs."""
+        while True:
+            try:
+                await self.cleanup_failed_temp_files()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log.warning("[tmp] failed-workspace cleanup error: %s", exc)
+            await asyncio.sleep(_FAILED_TEMP_CLEANUP_INTERVAL)
+
+    async def cleanup_failed_temp_files(self) -> int:
+        """Delete failed-job workspaces that are due under the saved policy."""
+        retention_hours = self._failed_temp_retention_hours()
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=retention_hours)
+        with SessionLocal() as db:
+            failed = db.query(DownloadJob).filter_by(status=JobStatus.failed).all()
+            due_ids = []
+            for job in failed:
+                if retention_hours == 0:
+                    due_ids.append(job.id)
+                    continue
+                failed_at = job.completed_at
+                if failed_at is not None and failed_at <= cutoff:
+                    due_ids.append(job.id)
+                    continue
+                if failed_at is None:
+                    path = self._tmp_dir(job.id)
+                    try:
+                        if datetime.utcfromtimestamp(path.stat().st_mtime) <= cutoff:
+                            due_ids.append(job.id)
+                    except FileNotFoundError:
+                        pass
+
+        removed = 0
+        for job_id in due_ids:
+            # Recheck immediately before deletion: the user may have retried
+            # the job while this cleanup pass was collecting candidates.
+            with SessionLocal() as db:
+                job = db.query(DownloadJob).filter_by(id=job_id).first()
+                if job is None or job.status != JobStatus.failed:
+                    continue
+            path = self._tmp_dir(job_id)
+            if not path.exists():
+                continue
+            await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+            self._logs.pop(job_id, None)
+            removed += 1
+        if removed:
+            _log.info("[tmp] removed %d expired failed download workspace(s)", removed)
+        return removed
 
     @property
     def network_ok(self) -> bool:
@@ -303,8 +369,8 @@ class DownloadManager:
 
     def _recover(self) -> None:
         """Reset jobs interrupted by a restart WITHOUT discarding their partial
-        downloads, so they resume rather than restart. Only orphaned temp dirs
-        (no resumable job) are removed."""
+        downloads, so they resume rather than restart. Failed jobs and their
+        temp dirs are removed on every application restart."""
         with SessionLocal() as db:
             interrupted = (
                 db.query(DownloadJob)
@@ -318,6 +384,13 @@ class DownloadManager:
                 job.started_at = None
                 job.download_bitrate = None
             db.commit()
+
+            failed = db.query(DownloadJob).filter_by(status=JobStatus.failed).all()
+            for job in failed:
+                db.delete(job)
+            if failed:
+                db.commit()
+                _log.info("[recover] removed %d failed job(s) on restart", len(failed))
 
             completed = db.query(DownloadJob).filter_by(status=JobStatus.completed).all()
             with_path = [j for j in completed if j.file_path]
@@ -348,16 +421,10 @@ class DownloadManager:
                         pass
                     _log.error("[recover] queue force-paused until the media "
                                "drive is back (resume from the Downloads page)")
-            else:
-                for job in missing:
-                    job.status = JobStatus.queued
-                    job.progress = 0.0
-                    job.completed_at = None
-                    job.archived = False   # re-downloading → show it again
-            for job in with_path:
-                if job.status == JobStatus.completed and Path(job.file_path).exists():
-                    # Completed MP4 present — drop any stale .mkv sitting beside it
-                    _safe_unlink(Path(job.file_path).with_suffix(".mkv"))
+            # Filesystem reconciliation handles absent files. An external
+            # deletion must not silently trigger a replacement download.
+            # The library may contain imported MKV files. Never delete media
+            # while recovering queue state; reconciliation only changes records.
             db.commit()
 
             # SELF-HEAL (inverse of the re-queue): a job stuck "queued" whose
@@ -380,7 +447,6 @@ class DownloadManager:
                 j.id for j in db.query(DownloadJob)
                 .filter(DownloadJob.status.in_(_RESUMABLE)).all()
             }
-
         root = self._tmp_root()
         root.mkdir(parents=True, exist_ok=True)
 
@@ -512,14 +578,10 @@ class DownloadManager:
         return await self._stop_running(job_id, "requeue")
 
     async def fail(self, job_id: int) -> bool:
-        """Mark a job failed and remove its temporary workspace.
-
-        A retry starts from a clean workspace. The completed library file, if
-        any, is never touched.
-        """
+        """Mark a job failed and apply the failed-temp retention policy."""
         if await self._stop_running(job_id, "fail"):
             return True
-        # Not running — flip its status directly and remove stale workspace.
+        # Not running — flip its status directly and apply retention.
         with SessionLocal() as db:
             job = db.query(DownloadJob).filter_by(id=job_id).first()
             if not job:
@@ -529,7 +591,7 @@ class DownloadManager:
             job.download_bitrate = None
             job.completed_at = datetime.utcnow()
             db.commit()
-        self._purge_job_files(job_id)
+        self._apply_failed_temp_policy(job_id)
         return True
 
     async def _stop_running(self, job_id: int, mode: str) -> bool:
@@ -800,6 +862,9 @@ class DownloadManager:
 
     async def _claim_next(self) -> int | None:
         """Atomically claim the next queued job (ordered by position)."""
+        from src.library.sync import library_sync
+        if library_sync.storage_error:
+            return None
         if self._paused_all or not self._network_ok or self._vpn_blocked or self._maintenance:
             return None
         async with self._claim_lock:
@@ -847,6 +912,16 @@ class DownloadManager:
         """
         await asyncio.to_thread(shutil.rmtree, self._tmp_dir(job_id), ignore_errors=True)
         self._logs.pop(job_id, None)
+
+    def _apply_failed_temp_policy(self, job_id: int) -> None:
+        """Delete immediately or retain this failed job's complete workspace."""
+        hours = self._failed_temp_retention_hours()
+        if hours == 0:
+            self._purge_job_files(job_id)
+            self.log_job(job_id, "Failure cleanup: temporary files deleted")
+        else:
+            unit = "hour" if hours == 1 else "hours"
+            self.log_job(job_id, f"Failure cleanup: temporary files kept for {hours} {unit}")
 
     # ── Job processing ─────────────────────────────────────────────────────
 
@@ -994,6 +1069,7 @@ class DownloadManager:
                                         prefer_height=self._preferred_height(),
                                         audio_language=self._original_audio_language(job),
                                         subtitle_language=self._subtitle_language(),
+                                        fetch_subtitles=early_vtt is None,
                                         connections=self._segment_connections(),
                                         referer=sources.referer or _STREAM_REFERER,
                                         pause=ctrl.pause,
@@ -1092,12 +1168,11 @@ class DownloadManager:
             self._mark_failed(job_id, f"All sources failed. Last error: {last_error}")
             return
 
-        # Subtitles were fetched up front (sidecar already in the library
-        # folder). Prefer subs embedded in the HLS stream itself when present;
-        # otherwise mux the pre-fetched VTT.
-        if result.subtitle_path is None:
+        # Keep the preferred subtitles selected up front for both playback
+        # and muxing. HLS subtitles are a fallback when no sidecar was fetched.
+        if early_vtt is not None:
             result.subtitle_path = early_vtt
-        elif result.subtitle_path != early_vtt:
+        elif result.subtitle_path is not None:
             # Stream carried its own subs — keep the sidecar in sync with them
             sidecar = subtitle_sidecar_path(dest, self._subtitle_language())
             try:
@@ -1119,6 +1194,29 @@ class DownloadManager:
         )
 
         tmp_out = work_dir / "out.mp4"
+        from src.subtitle_sync import align_subtitles, auto_sync_enabled
+        if result.subtitle_path is not None and auto_sync_enabled():
+            aligned = work_dir / "aligned-subs.vtt"
+            try:
+                aligned_ok = await align_subtitles(
+                    result.audio_path or result.video_path, result.subtitle_path, aligned,
+                    log=lambda m: self.log_job(job_id, m),
+                    cancelled=lambda: ctrl.cancel.is_set() or ctrl.requeue.is_set(),
+                )
+                if aligned_ok:
+                    result.subtitle_path = aligned
+                    sidecar = subtitle_sidecar_path(dest, self._subtitle_language())
+                    from src.library.organizer import _atomic_write_text
+                    _atomic_write_text(sidecar, aligned.read_text(encoding="utf-8"))
+                    self._update(job_id, subtitle_path=str(sidecar))
+            except Exception as exc:
+                self.log_job(job_id, f"Subtitle alignment skipped ({type(exc).__name__})")
+        if ctrl.requeue.is_set():
+            self._finish_yield(job_id, ctrl.stop_mode)
+            return
+        if ctrl.cancel.is_set():
+            self._finish_cancelled(job_id)
+            return
         _safe_unlink(tmp_out)
         ok, err = await self._to_mp4(result, tmp_out, job_id, ctrl)
 
@@ -1352,17 +1450,16 @@ class DownloadManager:
             return cmd
 
         label = "Encoding" if encode_video else "Remuxing"
-        ok, err = await self._run_ffmpeg(build_cmd(True, encode_video), job_id, ctrl, label)
-        if not ok and result.subtitle_path is not None and not ctrl.cancel.is_set():
-            self.log_job(job_id, "Retrying without subtitles…")
-            _safe_unlink(tmp_out)
-            ok, err = await self._run_ffmpeg(build_cmd(False, encode_video), job_id, ctrl, label)
+        # Keep subtitles only as Jellyfin-style external WebVTT sidecars.
+        # Embedding the same track here as mov_text creates two identical
+        # subtitle choices in Jellyfin and can make browsers render duplicates.
+        ok, err = await self._run_ffmpeg(build_cmd(False, encode_video), job_id, ctrl, label)
         # Last resort: a lossless stream-copy failed (a codec MP4 can't hold) —
         # re-encode so the download still completes rather than failing.
         if not ok and not encode_video and not ctrl.cancel.is_set():
             self.log_job(job_id, f"Stream-copy failed for {v_codec} — re-encoding as a fallback")
             _safe_unlink(tmp_out)
-            ok, err = await self._run_ffmpeg(build_cmd(True, True), job_id, ctrl, "Encoding")
+            ok, err = await self._run_ffmpeg(build_cmd(False, True), job_id, ctrl, "Encoding")
         return ok, err
 
     async def _run_ffmpeg(self, cmd: list[str], job_id: int, ctrl: _JobControl,
@@ -1464,6 +1561,26 @@ class DownloadManager:
         except (ValueError, TypeError):
             return settings.max_file_gb
 
+    async def _download_wyzie_vtt(self, job: DownloadJob, work_dir: Path,
+                                  language: str) -> Path | None:
+        """Try the preferred subtitle source; failures allow stream fallback."""
+        if not wyzie.is_enabled():
+            return None
+        self.log_job(job.id, "Trying Wyzie subtitles first…")
+        try:
+            vtt = await wyzie.download_subtitle(
+                job.imdb_id, work_dir / "subs.vtt",
+                season=job.season, episode=job.episode,
+                language=language,
+                log=lambda m: self.log_job(job.id, m),
+            )
+            if vtt is not None:
+                return vtt
+        except Exception as exc:
+            self.log_job(job.id, f"Wyzie subtitles failed: {exc}")
+        self.log_job(job.id, "Wyzie subtitles unavailable — trying stream subtitles")
+        return None
+
     async def _prefetch_assets(self, job: DownloadJob, dest: Path,
                                sources, work_dir: Path) -> Path | None:
         """Write NFO/artwork and the subtitle sidecar into the library folder
@@ -1480,35 +1597,19 @@ class DownloadManager:
         work_dir.mkdir(parents=True, exist_ok=True)
         subtitle_lang = self._subtitle_language()
         sidecar = subtitle_sidecar_path(dest, subtitle_lang)
-        vtt: Path | None = None
-        if sidecar.exists():
-            # Left by an earlier attempt of this job — reuse for muxing
-            vtt = work_dir / "subs.vtt"
+        # Re-evaluate the current source preference on retries; an old sidecar
+        # may have come from a source the user has since disabled.
+        vtt = await self._download_wyzie_vtt(job, work_dir, subtitle_lang)
+        if vtt is None and sources.subtitles:
+            vtt = await self._download_provider_vtt(
+                sources.subtitles, work_dir, job.id,
+                sources.referer or _STREAM_REFERER,
+                subtitle_lang)
+        if vtt is not None:
             try:
-                shutil.copyfile(sidecar, vtt)
-            except OSError:
-                vtt = None
-        else:
-            if sources.subtitles:
-                vtt = await self._download_provider_vtt(
-                    sources.subtitles, work_dir, job.id,
-                    sources.referer or _STREAM_REFERER,
-                    subtitle_lang)
-            if vtt is None and wyzie.is_enabled():
-                try:
-                    vtt = await wyzie.download_subtitle(
-                        job.imdb_id, work_dir / "subs.vtt",
-                        season=job.season, episode=job.episode,
-                        language=subtitle_lang,
-                        log=lambda m: self.log_job(job.id, m),
-                    )
-                except Exception as exc:
-                    self.log_job(job.id, f"Wyzie subtitles failed: {exc}")
-            if vtt is not None:
-                try:
-                    shutil.copyfile(vtt, sidecar)
-                except OSError as exc:
-                    self.log_job(job.id, f"Could not write subtitle sidecar: {exc}")
+                shutil.copyfile(vtt, sidecar)
+            except OSError as exc:
+                self.log_job(job.id, f"Could not write subtitle sidecar: {exc}")
         if sidecar.exists():
             self._update(job.id, subtitle_path=str(sidecar))
             self.log_job(job.id, f"Subtitles ready → {sidecar.name}")
@@ -1536,9 +1637,9 @@ class DownloadManager:
                     resp = await client.get(url, headers=headers)
                     resp.raise_for_status()
                     text = resp.text
-                if "WEBVTT" not in text[:64].upper() and not text.strip().startswith("1"):
-                    # Not obviously VTT/SRT — still save it; ffmpeg will try
-                    pass
+                if not has_timed_cues(text):
+                    self.log_job(job_id, f"Subtitle {lang} has no timed cues; trying next")
+                    continue
                 dest.write_text(clean_vtt_text(wyzie.srt_to_vtt(text))[0], encoding="utf-8")
                 self.log_job(job_id, f"Fetched subtitles ({lang})")
                 return dest
@@ -1628,7 +1729,7 @@ class DownloadManager:
         """Handle a job that yielded its slot: back to queue, or mark failed —
         keeping the partial download either way."""
         if mode == "fail":
-            self.log_job(job_id, "Marked failed by admin (progress kept)")
+            self.log_job(job_id, "Marked failed by admin")
             self._mark_failed(job_id, "Marked failed by admin")
             return
         self.log_job(job_id, "Sent back to queue (progress kept)")
@@ -1652,10 +1753,6 @@ class DownloadManager:
         )
 
     def _mark_failed(self, job_id: int, message: str) -> None:
-        # Failed jobs must not retain a partial segment tree.  This also covers
-        # the worker's generic exception handler, not only known ffmpeg/HLS
-        # failure branches.
-        self._purge_job_files(job_id)
         self._update(
             job_id,
             status=JobStatus.failed,
@@ -1664,6 +1761,7 @@ class DownloadManager:
             current_source=None,
             completed_at=datetime.utcnow(),
         )
+        self._apply_failed_temp_policy(job_id)
 
 
 async def _ffprobe(path: Path) -> dict:

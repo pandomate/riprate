@@ -11,3 +11,4 @@ python-multipart>=0.0.9
 pydantic>=2.0.0
 starlette>=0.38.0
 cryptography>=42.0.0
+ffsubsync==0.5.1

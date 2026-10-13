@@ -223,11 +223,12 @@ def _job_file(db: Session, job_id: int) -> Path:
 
 @router.get("/watch/{job_id}")
 def watch_stream(job_id: int, db: Session = Depends(get_db), _user=Depends(require_auth)):
-    """Stream the MP4 (Starlette FileResponse handles Range/seeking)."""
+    """Stream media (Starlette FileResponse handles Range/seeking)."""
     p = _job_file(db, job_id)
     return FileResponse(
         str(p),
-        media_type="video/mp4",
+        media_type={".mkv": "video/x-matroska", ".webm": "video/webm"}.get(
+            p.suffix.lower(), "video/mp4"),
         headers={"Cache-Control": "private, max-age=3600", "Accept-Ranges": "bytes"},
     )
 
@@ -254,7 +255,7 @@ def watch_subtitle(job_id: int, db: Session = Depends(get_db), _user=Depends(req
     if vtt is None:
         raise HTTPException(status_code=404, detail="No subtitles")
     return FileResponse(str(vtt), media_type="text/vtt",
-                        headers={"Cache-Control": "private, max-age=3600"})
+                        headers={"Cache-Control": "private, no-store"})
 
 
 # ── All files per item/season/show + zip-or-individual download ────────────

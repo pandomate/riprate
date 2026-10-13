@@ -17,7 +17,11 @@ services:
     devices:
       - "/dev/net/tun:/dev/net/tun"
     volumes:
-      - ${MEDIA_DIR:-./media/library}:/media/library
+      - type: bind
+        source: ${MEDIA_DIR:-./media}
+        target: /media/library
+        bind:
+          create_host_path: false
       - ./backend:/app
       - ./vpn_profiles:/opt/vpn_profiles:ro
       - ./.env:/app/.env
@@ -25,6 +29,7 @@ services:
     environment:
       - ENV_FILE=/app/.env
       - MEDIA_DIR=/media/library
+      - MEDIA_EXPECTED_FSTYPE=${MEDIA_EXPECTED_FSTYPE:-}
       - DATABASE_URL=sqlite:////app/data/riprate.db
       - SECRET_KEY=${SECRET_KEY:-}
       - SESSION_SECURE=${SESSION_SECURE:-false}
@@ -35,12 +40,21 @@ services:
       - VIDEO_CRF=${VIDEO_CRF:-20}
       - VIDEO_PRESET=${VIDEO_PRESET:-medium}
       - HISTORY_RETENTION_DAYS=${HISTORY_RETENTION_DAYS:-30}
+      - FAILED_TEMP_RETENTION_HOURS=${FAILED_TEMP_RETENTION_HOURS:-0}
       - SEARCH_SOURCE=${SEARCH_SOURCE:-tmdb}
       - VPN_PROFILE_DIR=/app/data/vpn-profiles
       - IMDB_COOKIE=${IMDB_COOKIE:-}
       - TMDB_API_KEY=${TMDB_API_KEY:-}
       - WYZIE_API_KEY=${WYZIE_API_KEY:-}
       #- MAX_STREAM_KBPS=${MAX_STREAM_KBPS:-5000}
+    # Docker otherwise inherits WSL's private DNS-tunneling address
+    # (commonly 10.255.255.254). OpenVPN's full-tunnel route sends that
+    # Windows-only address into tun0, where it hangs. Public resolvers remain
+    # reachable through tun0; the container kill switch blocks them on eth0
+    # until the VPN is established, preventing a DNS leak.
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
     env_file:
       - .env
     restart: unless-stopped
@@ -48,8 +62,8 @@ services:
   frontend:
     build: ./frontend
     ports:
-      # Local-only by default. Use an explicitly configured reverse proxy if
-      # remote access is needed; do not bind the app directly to 0.0.0.0.
+      # Keep the app local to this computer. WSL makes this IPv4 loopback
+      # port available at 127.0.0.1:5173 on Windows.
       - "127.0.0.1:5173:80"
     depends_on:
       - backend

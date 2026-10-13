@@ -165,7 +165,7 @@ class SetupRequest(BaseModel):
     tmdb_api_key: Optional[str] = Field(default=None, max_length=500)
     imdb_cookie: Optional[str] = Field(default=None, max_length=8000)
     wyzie_api_key: Optional[str] = Field(default=None, max_length=200)
-    wyzie_enabled: bool = True
+    wyzie_enabled: bool = False
     subtitle_language: str = Field(default="en", max_length=16)
     max_concurrent_downloads: int = Field(default=3, ge=1, le=10)
     segment_connections: int = Field(default=6, ge=1, le=16)
@@ -248,8 +248,9 @@ async def run_setup(body: SetupRequest, request: Request):
         set_setting("imdb_cookie", cookie)
         set_setting("imdb_cookie_set_at", datetime.utcnow().isoformat() if cookie else "")
 
-    # ── Wyzie subtitles (blank key ⇒ effectively off) ──
-    set_setting("wyzie_api_key", (body.wyzie_api_key or "").strip())
+    # ── Wyzie subtitles (omitted key keeps an existing configuration) ──
+    if body.wyzie_api_key is not None:
+        set_setting("wyzie_api_key", body.wyzie_api_key.strip())
     set_setting("wyzie_enabled", "true" if body.wyzie_enabled else "false")
     from src.subtitles import normalize_language
     set_setting("subtitle_language", normalize_language(body.subtitle_language))
